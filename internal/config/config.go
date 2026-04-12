@@ -12,6 +12,8 @@ type Config struct {
 	XrayStatsToken       string
 	AccountsBaseURL      string
 	InternalServiceToken string
+	SnapshotStorePath    string
+	SnapshotRetention    time.Duration
 	NodeID               string
 	Env                  string
 	ScrapeInterval       time.Duration
@@ -24,6 +26,7 @@ func Load() (Config, error) {
 		XrayStatsToken:       strings.TrimSpace(os.Getenv("XRAY_STATS_TOKEN")),
 		AccountsBaseURL:      strings.TrimSpace(os.Getenv("ACCOUNTS_BASE_URL")),
 		InternalServiceToken: strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_TOKEN")),
+		SnapshotStorePath:    strings.TrimSpace(os.Getenv("SNAPSHOT_STORE_PATH")),
 		NodeID:               strings.TrimSpace(os.Getenv("EXPORTER_NODE_ID")),
 		Env:                  strings.TrimSpace(os.Getenv("EXPORTER_ENV")),
 		ListenAddr:           strings.TrimSpace(os.Getenv("LISTEN_ADDR")),
@@ -35,6 +38,9 @@ func Load() (Config, error) {
 	if cfg.Env == "" {
 		cfg.Env = "prod"
 	}
+	if cfg.SnapshotStorePath == "" {
+		cfg.SnapshotStorePath = "/var/lib/xray-exporter/snapshots.db"
+	}
 
 	interval := strings.TrimSpace(os.Getenv("SCRAPE_INTERVAL"))
 	if interval == "" {
@@ -45,6 +51,17 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("parse SCRAPE_INTERVAL: %w", err)
 		}
 		cfg.ScrapeInterval = parsed
+	}
+
+	retention := strings.TrimSpace(os.Getenv("SNAPSHOT_RETENTION"))
+	if retention == "" {
+		cfg.SnapshotRetention = 72 * time.Hour
+	} else {
+		parsed, err := time.ParseDuration(retention)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse SNAPSHOT_RETENTION: %w", err)
+		}
+		cfg.SnapshotRetention = parsed
 	}
 
 	switch {

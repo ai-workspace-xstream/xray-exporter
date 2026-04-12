@@ -9,6 +9,7 @@ import (
 
 	"xray-exporter/internal/accounts"
 	"xray-exporter/internal/config"
+	"xray-exporter/internal/history"
 	"xray-exporter/internal/httpapi"
 	"xray-exporter/internal/service"
 	"xray-exporter/internal/xray"
@@ -20,6 +21,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	store, err := history.NewSQLiteStore(cfg.SnapshotStorePath, cfg.SnapshotRetention)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer store.Close()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -29,12 +36,13 @@ func main() {
 		cfg.ScrapeInterval,
 		xray.NewClient(cfg.XrayStatsURL, cfg.XrayStatsToken),
 		accounts.NewClient(cfg.AccountsBaseURL, cfg.InternalServiceToken),
+		store,
 	)
 	svc.Start(ctx)
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: httpapi.New(svc).Routes(),
+		Handler: httpapi.New(svc, cfg.InternalServiceToken).Routes(),
 	}
 
 	go func() {
