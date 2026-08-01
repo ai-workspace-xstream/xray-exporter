@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,48 @@ func (s stubIdentitySource) FetchIdentities(context.Context) (map[string]model.I
 	return s.identities, nil
 }
 
+type memoryHistory struct {
+	snapshots []model.Snapshot
+}
+
+func (m *memoryHistory) SaveSnapshot(_ context.Context, snapshot model.Snapshot) error {
+	for i, existing := range m.snapshots {
+		if existing.CollectedAt.Equal(snapshot.CollectedAt) {
+			m.snapshots[i] = snapshot
+			return nil
+		}
+	}
+	m.snapshots = append(m.snapshots, snapshot)
+	sort.Slice(m.snapshots, func(i, j int) bool {
+		return m.snapshots[i].CollectedAt.Before(m.snapshots[j].CollectedAt)
+	})
+	return nil
+}
+
+func (m *memoryHistory) LatestSnapshot(context.Context) (model.Snapshot, error) {
+	if len(m.snapshots) == 0 {
+		return model.Snapshot{}, nil
+	}
+	return m.snapshots[len(m.snapshots)-1], nil
+}
+
+func (m *memoryHistory) WindowSnapshots(_ context.Context, since, until time.Time, limit int, cursor *time.Time) ([]model.Snapshot, error) {
+	var snapshots []model.Snapshot
+	for _, snapshot := range m.snapshots {
+		if snapshot.CollectedAt.Before(since) || snapshot.CollectedAt.After(until) {
+			continue
+		}
+		if cursor != nil && !snapshot.CollectedAt.After(cursor.UTC()) {
+			continue
+		}
+		snapshots = append(snapshots, snapshot)
+		if len(snapshots) == limit {
+			break
+		}
+	}
+	return snapshots, nil
+}
+
 func TestCollectFallsBackToUnknownEmailOnCacheMiss(t *testing.T) {
 	svc := New(
 		"jp-node",
@@ -44,6 +87,7 @@ func TestCollectFallsBackToUnknownEmailOnCacheMiss(t *testing.T) {
 			{UUID: "acct-1", InboundTag: "premium", Direction: "downlink", Value: 20},
 		}},
 		stubIdentitySource{err: errors.New("accounts unavailable")},
+		&memoryHistory{},
 	)
 
 	if err := svc.Collect(context.Background()); err != nil {
@@ -73,6 +117,7 @@ func TestCollectFailsGracefullyWhenXrayUnavailable(t *testing.T) {
 		time.Minute,
 		stubCounterSource{err: errors.New("xray down")},
 		stubIdentitySource{},
+		&memoryHistory{},
 	)
 
 	if err := svc.Collect(context.Background()); err == nil {
@@ -100,6 +145,7 @@ func TestMetricsIncludeRequiredLabels(t *testing.T) {
 		stubIdentitySource{identities: map[string]model.Identity{
 			"acct-1": {UUID: "acct-1", Email: "user@example.com", AccountUUID: "acct-1"},
 		}},
+		&memoryHistory{},
 	)
 
 	if err := svc.Collect(context.Background()); err != nil {
@@ -132,6 +178,7 @@ func TestSnapshotContractJSON(t *testing.T) {
 		stubIdentitySource{identities: map[string]model.Identity{
 			"acct-1": {UUID: "acct-1", Email: "user@example.com", AccountUUID: "acct-1"},
 		}},
+		&memoryHistory{},
 	)
 
 	if err := svc.Collect(context.Background()); err != nil {
@@ -174,6 +221,7 @@ func TestNormalizeSnapshotAggregatesByUUIDAndInboundTag(t *testing.T) {
 		stubIdentitySource{identities: map[string]model.Identity{
 			"acct-1": {UUID: "acct-1", Email: "user@example.com"},
 		}},
+		&memoryHistory{},
 	)
 
 	if err := svc.Collect(context.Background()); err != nil {

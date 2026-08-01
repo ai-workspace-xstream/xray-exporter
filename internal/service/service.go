@@ -20,12 +20,19 @@ type identitySource interface {
 	FetchIdentities(ctx context.Context) (map[string]model.Identity, error)
 }
 
+type historyStore interface {
+	SaveSnapshot(ctx context.Context, snapshot model.Snapshot) error
+	LatestSnapshot(ctx context.Context) (model.Snapshot, error)
+	WindowSnapshots(ctx context.Context, since, until time.Time, limit int, cursor *time.Time) ([]model.Snapshot, error)
+}
+
 type Service struct {
 	nodeID         string
 	env            string
 	scrapeInterval time.Duration
 	counters       counterSource
 	identities     identitySource
+	history        historyStore
 
 	mu              sync.RWMutex
 	latest          model.Snapshot
@@ -35,13 +42,14 @@ type Service struct {
 	lastCollectOK   bool
 }
 
-func New(nodeID, env string, scrapeInterval time.Duration, counters counterSource, identities identitySource) *Service {
+func New(nodeID, env string, scrapeInterval time.Duration, counters counterSource, identities identitySource, history historyStore) *Service {
 	return &Service{
 		nodeID:         strings.TrimSpace(nodeID),
 		env:            strings.TrimSpace(env),
 		scrapeInterval: scrapeInterval,
 		counters:       counters,
 		identities:     identities,
+		history:        history,
 	}
 }
 
@@ -78,7 +86,12 @@ func (s *Service) Collect(ctx context.Context) error {
 		identityMap = map[string]model.Identity{}
 	}
 
-	snapshot := normalizeSnapshot(s.nodeID, s.env, time.Now().UTC(), counters, identityMap)
+	collectedAt := time.Now().UTC().Truncate(time.Minute)
+	snapshot := normalizeSnapshot(s.nodeID, s.env, collectedAt, counters, identityMap)
+	if err := s.history.SaveSnapshot(ctx, snapshot); err != nil {
+		s.recordFailure(err)
+		return err
+	}
 	if identitiesErr != nil {
 		s.recordSuccess(snapshot, fmt.Sprintf("identity lookup degraded: %v", identitiesErr))
 		return nil
@@ -96,6 +109,39 @@ func (s *Service) Snapshot() model.Snapshot {
 
 func (s *Service) SnapshotJSON() ([]byte, error) {
 	return json.Marshal(s.Snapshot())
+}
+
+func (s *Service) LatestSnapshot(ctx context.Context) (model.Snapshot, error) {
+	snapshot := s.Snapshot()
+	if !snapshot.CollectedAt.IsZero() {
+		return snapshot, nil
+	}
+	return s.history.LatestSnapshot(ctx)
+}
+
+func (s *Service) SnapshotWindow(ctx context.Context, since, until time.Time, limit int, cursor *time.Time) (model.SnapshotWindowPage, error) {
+	if limit <= 0 {
+		limit = 120
+	}
+
+	snapshots, err := s.history.WindowSnapshots(ctx, since.UTC(), until.UTC(), limit+1, cursor)
+	if err != nil {
+		return model.SnapshotWindowPage{}, err
+	}
+
+	page := model.SnapshotWindowPage{
+		NodeID: s.nodeID,
+		Env:    s.env,
+	}
+	if len(snapshots) > limit {
+		page.HasMore = true
+		page.Snapshots = append(page.Snapshots, snapshots[:limit]...)
+		page.NextCursor = page.Snapshots[len(page.Snapshots)-1].CollectedAt.UTC().Format(time.RFC3339)
+		return page, nil
+	}
+
+	page.Snapshots = append(page.Snapshots, snapshots...)
+	return page, nil
 }
 
 func (s *Service) Health() (bool, string) {

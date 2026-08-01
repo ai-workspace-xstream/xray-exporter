@@ -17,6 +17,14 @@ type Snapshot struct {
 	Samples     []Sample  `json:"samples"`
 }
 
+type SnapshotWindowPage struct {
+	NodeID     string     `json:"node_id"`
+	Env        string     `json:"env"`
+	Snapshots  []Snapshot `json:"snapshots"`
+	HasMore    bool       `json:"has_more"`
+	NextCursor string     `json:"next_cursor,omitempty"`
+}
+
 type RawCounter struct {
 	UUID       string
 	InboundTag string
