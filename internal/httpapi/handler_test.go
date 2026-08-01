@@ -103,3 +103,33 @@ func TestSnapshotWindowSupportsPagination(t *testing.T) {
 		t.Fatalf("unexpected next cursor %q", page.NextCursor)
 	}
 }
+
+func TestSnapshotWindowRejectsInvalidBoundsAndLimit(t *testing.T) {
+	history := &handlerHistory{}
+	svc := service.New("jp-node", "uat", time.Minute, handlerCounterSource{}, handlerIdentitySource{}, history)
+	handler := New(svc, "secret").Routes()
+
+	for _, query := range []string{
+		"since=2026-04-12T10:02:00Z&until=2026-04-12T10:01:00Z",
+		"since=2026-04-12T10:00:00Z&limit=2junk",
+		"since=2026-04-12T10:00:00Z&limit=0",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/snapshots/window?"+query, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected bad request for %s, got %d", query, rec.Code)
+		}
+	}
+}
+
+func TestParseLimitCapsLargeRequests(t *testing.T) {
+	limit, err := parseLimit("999999")
+	if err != nil {
+		t.Fatalf("parse limit: %v", err)
+	}
+	if limit != 1440 {
+		t.Fatalf("expected limit cap 1440, got %d", limit)
+	}
+}

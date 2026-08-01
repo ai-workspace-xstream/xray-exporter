@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"xray-exporter/internal/model"
@@ -20,10 +21,14 @@ type SQLiteStore struct {
 }
 
 func NewSQLiteStore(path string, retention time.Duration) (*SQLiteStore, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("snapshot store path is required")
+	}
 	if retention <= 0 {
 		return nil, fmt.Errorf("retention must be positive")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create snapshot store directory: %w", err)
 	}
 
@@ -32,10 +37,18 @@ func NewSQLiteStore(path string, retention time.Duration) (*SQLiteStore, error) 
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}
 
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &SQLiteStore{db: db, retention: retention}
 	if err := store.init(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// Snapshots contain UUIDs and display emails. Keep the file private even
+	// when the process umask is permissive.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("protect snapshot store: %w", err)
 	}
 	return store, nil
 }
@@ -48,12 +61,21 @@ func (s *SQLiteStore) Close() error {
 }
 
 func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshot model.Snapshot) error {
+	if snapshot.CollectedAt.IsZero() {
+		return fmt.Errorf("snapshot collected_at is required")
+	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin snapshot transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO snapshots (collected_at, payload)
 		VALUES (?, ?)
 		ON CONFLICT(collected_at) DO UPDATE SET payload = excluded.payload
@@ -62,11 +84,14 @@ func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshot model.Snapshot)
 	}
 
 	cutoff := snapshot.CollectedAt.UTC().Add(-s.retention)
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM snapshots
 		WHERE collected_at < ?
 	`, cutoff.Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("prune snapshots: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit snapshot: %w", err)
 	}
 	return nil
 }
@@ -88,6 +113,12 @@ func (s *SQLiteStore) LatestSnapshot(ctx context.Context) (model.Snapshot, error
 }
 
 func (s *SQLiteStore) WindowSnapshots(ctx context.Context, since, until time.Time, limit int, cursor *time.Time) ([]model.Snapshot, error) {
+	if since.IsZero() || until.IsZero() {
+		return nil, fmt.Errorf("snapshot window bounds are required")
+	}
+	if until.Before(since) {
+		return nil, fmt.Errorf("snapshot window until must not be before since")
+	}
 	if limit <= 0 {
 		limit = 1
 	}
@@ -134,6 +165,9 @@ func (s *SQLiteStore) WindowSnapshots(ctx context.Context, since, until time.Tim
 }
 
 func (s *SQLiteStore) init(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
+		return fmt.Errorf("configure sqlite busy timeout: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS snapshots (
 			collected_at TEXT PRIMARY KEY,

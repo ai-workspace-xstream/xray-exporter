@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,7 +60,7 @@ func (h *Handler) snapshot(w http.ResponseWriter, r *http.Request) {
 
 	snapshot, err := h.service.LatestSnapshot(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "snapshot unavailable", http.StatusInternalServerError)
 		return
 	}
 
@@ -91,6 +93,10 @@ func (h *Handler) window(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if until.Before(since) {
+		http.Error(w, "until must not be before since", http.StatusBadRequest)
+		return
+	}
 
 	limit := 120
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
@@ -113,7 +119,7 @@ func (h *Handler) window(w http.ResponseWriter, r *http.Request) {
 
 	page, err := h.service.SnapshotWindow(r.Context(), since, until, limit, cursor)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "snapshot window unavailable", http.StatusInternalServerError)
 		return
 	}
 
@@ -123,15 +129,16 @@ func (h *Handler) window(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authorize(r *http.Request) bool {
+	expected := "Bearer " + strings.TrimSpace(h.token)
 	if h.token == "" {
 		return false
 	}
-	return strings.TrimSpace(r.Header.Get("Authorization")) == "Bearer "+h.token
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(r.Header.Get("Authorization"))), []byte(expected)) == 1
 }
 
 func parseLimit(raw string) (int, error) {
-	var limit int
-	if _, err := fmt.Sscanf(raw, "%d", &limit); err != nil {
+	limit, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
 		return 0, err
 	}
 	if limit <= 0 {
