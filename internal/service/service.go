@@ -238,6 +238,7 @@ func (s *Service) recordSuccess(snapshot model.Snapshot, message string) {
 func normalizeSnapshot(nodeID, env string, collectedAt time.Time, counters []model.RawCounter, identities map[string]model.Identity) model.Snapshot {
 	type aggregate struct {
 		uuid       string
+		email      string
 		inboundTag string
 		uplink     int64
 		downlink   int64
@@ -245,21 +246,41 @@ func normalizeSnapshot(nodeID, env string, collectedAt time.Time, counters []mod
 
 	aggregates := map[string]*aggregate{}
 	for _, counter := range counters {
-		uuid := strings.TrimSpace(counter.UUID)
-		if uuid == "" {
+		identifier := strings.TrimSpace(counter.UUID)
+		if identifier == "" {
 			continue
 		}
+
+		identity, found := lookupIdentity(identities, identifier)
+		uuid := identifier
+		email := ""
+		if found {
+			if accountUUID := strings.TrimSpace(identity.AccountUUID); accountUUID != "" {
+				uuid = accountUUID
+			} else if proxyUUID := strings.TrimSpace(identity.UUID); proxyUUID != "" {
+				uuid = proxyUUID
+			}
+			email = strings.TrimSpace(identity.Email)
+		} else if strings.Contains(identifier, "@") {
+			// An email without an Accounts identity cannot be safely written to
+			// Billing's UUID-backed tables. Drop it instead of producing a
+			// sample that will fail later in the chain.
+			continue
+		}
+
 		key := uuid + "\x00" + strings.TrimSpace(counter.InboundTag)
 		entry, ok := aggregates[key]
 		if !ok {
-			entry = &aggregate{uuid: uuid, inboundTag: strings.TrimSpace(counter.InboundTag)}
+			entry = &aggregate{uuid: uuid, email: email, inboundTag: strings.TrimSpace(counter.InboundTag)}
 			aggregates[key] = entry
+		} else if entry.email == "" && email != "" {
+			entry.email = email
 		}
 		switch strings.TrimSpace(counter.Direction) {
 		case "uplink":
-			entry.uplink = counter.Value
+			entry.uplink += counter.Value
 		case "downlink":
-			entry.downlink = counter.Value
+			entry.downlink += counter.Value
 		}
 	}
 
@@ -272,9 +293,9 @@ func normalizeSnapshot(nodeID, env string, collectedAt time.Time, counters []mod
 	samples := make([]model.Sample, 0, len(keys))
 	for _, key := range keys {
 		entry := aggregates[key]
-		email := "unknown"
-		if identity, ok := identities[entry.uuid]; ok && strings.TrimSpace(identity.Email) != "" {
-			email = strings.TrimSpace(identity.Email)
+		email := entry.email
+		if email == "" {
+			email = "unknown"
 		}
 		samples = append(samples, model.Sample{
 			UUID:               entry.uuid,
@@ -291,6 +312,29 @@ func normalizeSnapshot(nodeID, env string, collectedAt time.Time, counters []mod
 		Env:         strings.TrimSpace(env),
 		Samples:     samples,
 	}
+}
+
+func lookupIdentity(identities map[string]model.Identity, identifier string) (model.Identity, bool) {
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return model.Identity{}, false
+	}
+	if identity, ok := identities[trimmed]; ok {
+		return identity, true
+	}
+	if identity, ok := identities[strings.ToLower(trimmed)]; ok {
+		return identity, true
+	}
+	// Keep compatibility with callers that provide a UUID-only map rather
+	// than the multi-key index built by accounts.Client.
+	for _, identity := range identities {
+		if strings.EqualFold(strings.TrimSpace(identity.UUID), trimmed) ||
+			strings.EqualFold(strings.TrimSpace(identity.AccountUUID), trimmed) ||
+			strings.EqualFold(strings.TrimSpace(identity.Email), trimmed) {
+			return identity, true
+		}
+	}
+	return model.Identity{}, false
 }
 
 func cloneSnapshot(snapshot model.Snapshot) model.Snapshot {

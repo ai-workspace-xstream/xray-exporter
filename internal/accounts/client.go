@@ -58,14 +58,26 @@ func (c *Client) FetchIdentities(ctx context.Context) (map[string]model.Identity
 
 	result := make(map[string]model.Identity, len(payload.Identities))
 	for _, identity := range payload.Identities {
-		uuid := strings.TrimSpace(identity.UUID)
-		if uuid == "" {
+		proxyUUID := strings.TrimSpace(identity.UUID)
+		accountUUID := strings.TrimSpace(identity.AccountUUID)
+		email := strings.ToLower(strings.TrimSpace(identity.Email))
+		if proxyUUID == "" && accountUUID == "" && email == "" {
 			continue
 		}
-		result[uuid] = model.Identity{
-			UUID:        uuid,
-			Email:       strings.TrimSpace(identity.Email),
-			AccountUUID: strings.TrimSpace(identity.AccountUUID),
+
+		canonical := model.Identity{
+			UUID:        proxyUUID,
+			Email:       email,
+			AccountUUID: accountUUID,
+		}
+		// Xray may label a counter with the proxy UUID, the account UUID, or
+		// the user's email depending on which config generation produced it.
+		// Keep all three lookup keys pointing at the same canonical identity;
+		// the exporter will emit AccountUUID to Billing.
+		for _, key := range []string{proxyUUID, accountUUID, email} {
+			if key != "" {
+				result[strings.ToLower(key)] = canonical
+			}
 		}
 	}
 	return result, nil

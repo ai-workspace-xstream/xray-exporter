@@ -236,3 +236,56 @@ func TestNormalizeSnapshotAggregatesByUUIDAndInboundTag(t *testing.T) {
 		t.Fatalf("unexpected sample ordering %#v", snapshot.Samples)
 	}
 }
+
+func TestNormalizeSnapshotResolvesEmailAndProxyUUIDToAccountUUID(t *testing.T) {
+	svc := New(
+		"jp-node",
+		"uat",
+		time.Minute,
+		stubCounterSource{counters: []model.RawCounter{
+			{UUID: "proxy-1", InboundTag: "xhttp", Direction: "uplink", Value: 100},
+			{UUID: "proxy-1", InboundTag: "xhttp", Direction: "downlink", Value: 200},
+			{UUID: "USER@EXAMPLE.COM", InboundTag: "xhttp", Direction: "uplink", Value: 50},
+			{UUID: "USER@EXAMPLE.COM", InboundTag: "xhttp", Direction: "downlink", Value: 60},
+			{UUID: "USER@EXAMPLE.COM", InboundTag: "tcp", Direction: "uplink", Value: 300},
+			{UUID: "USER@EXAMPLE.COM", InboundTag: "tcp", Direction: "downlink", Value: 400},
+		}},
+		stubIdentitySource{identities: map[string]model.Identity{
+			"proxy-1": {
+				UUID:        "proxy-1",
+				Email:       "user@example.com",
+				AccountUUID: "account-1",
+			},
+		}},
+		&memoryHistory{},
+	)
+
+	if err := svc.Collect(context.Background()); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	snapshot := svc.Snapshot()
+	if len(snapshot.Samples) != 2 {
+		t.Fatalf("expected one sample per inbound after account resolution, got %#v", snapshot.Samples)
+	}
+	for _, sample := range snapshot.Samples {
+		if sample.UUID != "account-1" {
+			t.Fatalf("expected canonical account UUID, got %#v", sample)
+		}
+		if sample.Email != "user@example.com" {
+			t.Fatalf("expected normalized email, got %#v", sample)
+		}
+		if sample.InboundTag == "xhttp" && (sample.UplinkBytesTotal != 150 || sample.DownlinkBytesTotal != 260) {
+			t.Fatalf("expected xhttp counters to merge by canonical account, got %#v", sample)
+		}
+	}
+}
+
+func TestNormalizeSnapshotDropsUnresolvedEmail(t *testing.T) {
+	snapshot := normalizeSnapshot("node", "uat", time.Now(), []model.RawCounter{
+		{UUID: "missing@example.com", InboundTag: "xhttp", Direction: "uplink", Value: 1},
+	}, map[string]model.Identity{})
+	if len(snapshot.Samples) != 0 {
+		t.Fatalf("expected unresolved email counter to be dropped, got %#v", snapshot.Samples)
+	}
+}
