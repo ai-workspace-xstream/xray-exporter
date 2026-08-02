@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"xray-exporter/internal/geoip"
+	"xray-exporter/internal/snapshot"
 )
 
 // Command line configuration
@@ -31,6 +32,13 @@ var opts struct {
 	GeoIPDir               string `short:"g" long:"geoip-dir" description:"Directory for GeoLite2 databases" value-name:"PATH" default:"."`
 	Version                bool   `long:"version" description:"Display the version and exit"`
 	LogLevel               string `long:"log-level" description:"Log level: error, warn, info, debug (env: LOG_LEVEL) (default: warn)" value-name:"LEVEL"`
+	NodeID                 string `long:"node-id" description:"Billing node identifier (or EXPORTER_NODE_ID)"`
+	Environment            string `long:"environment" description:"Billing environment (or EXPORTER_ENV)"`
+	AccountsBaseURL        string `long:"accounts-base-url" description:"Accounts base URL (or ACCOUNTS_BASE_URL)"`
+	InternalServiceToken   string `long:"internal-service-token" description:"Snapshot API token (or INTERNAL_SERVICE_TOKEN)"`
+	SnapshotStorePath      string `long:"snapshot-store-path" description:"Snapshot JSON store (or SNAPSHOT_STORE_PATH)"`
+	SnapshotRetention      string `long:"snapshot-retention" description:"Snapshot retention (or SNAPSHOT_RETENTION)"`
+	SnapshotInterval       string `long:"snapshot-interval" description:"Snapshot collection interval (or SNAPSHOT_INTERVAL)"`
 }
 
 // Build information injected during compilation
@@ -126,11 +134,37 @@ func main() {
 	}
 	defer exporter.Close()
 
+	nodeID := firstNonEmpty(opts.NodeID, os.Getenv("EXPORTER_NODE_ID"))
+	environment := firstNonEmpty(opts.Environment, os.Getenv("EXPORTER_ENV"), "uat")
+	accountsBaseURL := firstNonEmpty(opts.AccountsBaseURL, os.Getenv("ACCOUNTS_BASE_URL"))
+	internalServiceToken := firstNonEmpty(opts.InternalServiceToken, os.Getenv("INTERNAL_SERVICE_TOKEN"))
+	snapshotStorePath := firstNonEmpty(opts.SnapshotStorePath, os.Getenv("SNAPSHOT_STORE_PATH"))
+	if snapshotStorePath == "" {
+		snapshotStorePath = "/var/lib/xray-exporter/snapshots.json"
+	}
+	snapshotRetention := parseDuration(firstNonEmpty(opts.SnapshotRetention, os.Getenv("SNAPSHOT_RETENTION")), 72*time.Hour)
+	snapshotInterval := parseDuration(firstNonEmpty(opts.SnapshotInterval, os.Getenv("SNAPSHOT_INTERVAL")), time.Minute)
+	var snapshotStore *snapshot.Store
+	var snapshotService *snapshot.Service
+	if nodeID != "" && internalServiceToken != "" && accountsBaseURL != "" {
+		snapshotStore, err = snapshot.NewStore(snapshotStorePath, snapshotRetention)
+		if err != nil {
+			logrus.WithError(err).Fatal("Failed to create snapshot store")
+		}
+		snapshotService = snapshot.NewService(nodeID, environment, exporter, snapshot.NewAccountsClient(accountsBaseURL, internalServiceToken), snapshotStore, scrapeTimeout)
+		go runSnapshotLoop(snapshotService, snapshotInterval)
+	} else {
+		logrus.Warn("Billing snapshots disabled: EXPORTER_NODE_ID, ACCOUNTS_BASE_URL and INTERNAL_SERVICE_TOKEN are required")
+	}
+
 	// Set up HTTP routes
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc(opts.MetricsPath, scrapeHandler(exporter))
 	mux.HandleFunc("/health", healthHandler)
+	if snapshotStore != nil {
+		mux.Handle("/v1/snapshots/", snapshot.Handler(snapshotStore, internalServiceToken))
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprintf(w, `<html>
@@ -186,4 +220,42 @@ func main() {
 	}
 
 	logrus.Info("Server exited")
+}
+
+func runSnapshotLoop(service *snapshot.Service, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	collect := func() {
+		if _, err := service.Collect(); err != nil {
+			logrus.WithError(err).Warn("Billing snapshot collection failed")
+		}
+	}
+	collect()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		collect()
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func parseDuration(value string, fallback time.Duration) time.Duration {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		logrus.WithError(err).Warnf("invalid duration %q; using %s", value, fallback)
+		return fallback
+	}
+	return parsed
 }

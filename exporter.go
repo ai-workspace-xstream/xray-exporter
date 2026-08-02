@@ -20,6 +20,7 @@ import (
 
 	"xray-exporter/internal/geoip"
 	"xray-exporter/internal/logparser"
+	"xray-exporter/internal/snapshot"
 )
 
 // Default time window for user activity metrics (in minutes)
@@ -268,6 +269,38 @@ func (e *Exporter) scrapeXrayMetrics(ctx context.Context, ch chan<- prometheus.M
 	}
 
 	return nil
+}
+
+// TrafficCounters returns the raw cumulative per-user counters used by the
+// billing snapshot API. It deliberately reuses the same Xray Stats API and
+// filtering rules as the Prometheus collector, so the observability and
+// billing paths have one source of truth without changing /scrape output.
+func (e *Exporter) TrafficCounters(timeout time.Duration) ([]snapshot.RawCounter, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	resp, err := e.callWithRetry(ctx, func() (any, error) {
+		return command.NewStatsServiceClient(e.conn).QueryStats(ctx, &command.QueryStatsRequest{Reset_: false})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stats: %w", err)
+	}
+	statsResp := resp.(*command.QueryStatsResponse)
+	counters := make([]snapshot.RawCounter, 0)
+	for _, stat := range statsResp.GetStat() {
+		parts := strings.Split(stat.GetName(), ">>>")
+		if len(parts) < 4 || parts[0] != "user" {
+			continue
+		}
+		if !e.userTrafficMetrics {
+			continue
+		}
+		counters = append(counters, snapshot.RawCounter{
+			Identifier: parts[1],
+			Direction:  parts[3],
+			Value:      stat.GetValue(),
+		})
+	}
+	return counters, nil
 }
 
 // Collects system runtime metrics from Xray.
