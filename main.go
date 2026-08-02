@@ -39,6 +39,7 @@ var opts struct {
 	SnapshotStorePath      string `long:"snapshot-store-path" description:"Snapshot JSON store (or SNAPSHOT_STORE_PATH)"`
 	SnapshotRetention      string `long:"snapshot-retention" description:"Snapshot retention (or SNAPSHOT_RETENTION)"`
 	SnapshotInterval       string `long:"snapshot-interval" description:"Snapshot collection interval (or SNAPSHOT_INTERVAL)"`
+	VectorSnapshotURL      string `long:"vector-snapshot-url" description:"Vector snapshot input URL (or VECTOR_SNAPSHOT_URL)"`
 }
 
 // Build information injected during compilation
@@ -144,15 +145,20 @@ func main() {
 	}
 	snapshotRetention := parseDuration(firstNonEmpty(opts.SnapshotRetention, os.Getenv("SNAPSHOT_RETENTION")), 72*time.Hour)
 	snapshotInterval := parseDuration(firstNonEmpty(opts.SnapshotInterval, os.Getenv("SNAPSHOT_INTERVAL")), time.Minute)
+	vectorSnapshotURL := firstNonEmpty(opts.VectorSnapshotURL, os.Getenv("VECTOR_SNAPSHOT_URL"))
 	var snapshotStore *snapshot.Store
 	var snapshotService *snapshot.Service
+	var snapshotPusher *snapshot.Pusher
 	if nodeID != "" && internalServiceToken != "" && accountsBaseURL != "" {
 		snapshotStore, err = snapshot.NewStore(snapshotStorePath, snapshotRetention)
 		if err != nil {
 			logrus.WithError(err).Fatal("Failed to create snapshot store")
 		}
 		snapshotService = snapshot.NewService(nodeID, environment, exporter, snapshot.NewAccountsClient(accountsBaseURL, internalServiceToken), snapshotStore, scrapeTimeout)
-		go runSnapshotLoop(snapshotService, snapshotInterval)
+		if vectorSnapshotURL != "" {
+			snapshotPusher = snapshot.NewPusher(vectorSnapshotURL, internalServiceToken, scrapeTimeout)
+		}
+		go runSnapshotLoop(snapshotService, snapshotInterval, snapshotPusher)
 	} else {
 		logrus.Warn("Billing snapshots disabled: EXPORTER_NODE_ID, ACCOUNTS_BASE_URL and INTERNAL_SERVICE_TOKEN are required")
 	}
@@ -222,13 +228,20 @@ func main() {
 	logrus.Info("Server exited")
 }
 
-func runSnapshotLoop(service *snapshot.Service, interval time.Duration) {
+func runSnapshotLoop(service *snapshot.Service, interval time.Duration, pusher *snapshot.Pusher) {
 	if interval <= 0 {
 		interval = time.Minute
 	}
 	collect := func() {
-		if _, err := service.Collect(); err != nil {
+		value, err := service.Collect()
+		if err != nil {
 			logrus.WithError(err).Warn("Billing snapshot collection failed")
+			return
+		}
+		if pusher != nil {
+			if err := pusher.Push(context.Background(), value); err != nil {
+				logrus.WithError(err).Warn("Vector snapshot push failed")
+			}
 		}
 	}
 	collect()

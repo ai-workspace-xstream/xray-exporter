@@ -48,8 +48,8 @@ func (s *Service) Collect() (Snapshot, error) {
 
 func normalize(counters []RawCounter, identities map[string]Identity) []Sample {
 	type aggregate struct {
-		uuid, email, inbound string
-		uplink, downlink     int64
+		uuid, email      string
+		uplink, downlink int64
 	}
 	aggregates := map[string]*aggregate{}
 	for _, counter := range counters {
@@ -76,11 +76,13 @@ func normalize(counters []RawCounter, identities map[string]Identity) []Sample {
 		if uuid == "" {
 			continue
 		}
-		inbound := strings.TrimSpace(counter.InboundTag)
-		key := uuid + "\x00" + inbound
+		// Billing is account based. A user can appear on multiple inbounds on
+		// one or many nodes; collapse all inbound counters into one UUID sample
+		// before the snapshot leaves the exporter.
+		key := uuid
 		entry := aggregates[key]
 		if entry == nil {
-			entry = &aggregate{uuid: uuid, email: email, inbound: inbound}
+			entry = &aggregate{uuid: uuid, email: email}
 			aggregates[key] = entry
 		}
 		switch strings.TrimSpace(counter.Direction) {
@@ -98,7 +100,7 @@ func normalize(counters []RawCounter, identities map[string]Identity) []Sample {
 	result := make([]Sample, 0, len(keys))
 	for _, key := range keys {
 		entry := aggregates[key]
-		result = append(result, Sample{UUID: entry.uuid, Email: entry.email, InboundTag: entry.inbound, UplinkBytesTotal: entry.uplink, DownlinkBytesTotal: entry.downlink})
+		result = append(result, Sample{UUID: entry.uuid, Email: entry.email, UplinkBytesTotal: entry.uplink, DownlinkBytesTotal: entry.downlink})
 	}
 	return result
 }

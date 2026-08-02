@@ -58,6 +58,26 @@ func TestNormalizeDropsUnresolvedEmail(t *testing.T) {
 	}
 }
 
+func TestNormalizeAggregatesMultipleInboundsByAccount(t *testing.T) {
+	got := normalize([]RawCounter{
+		{Identifier: "account-1", InboundTag: "xhttp-local", Direction: "uplink", Value: 100},
+		{Identifier: "account-1", InboundTag: "xhttp-local", Direction: "downlink", Value: 200},
+		{Identifier: "account-1", InboundTag: "tcp-local", Direction: "uplink", Value: 300},
+		{Identifier: "account-1", InboundTag: "tcp-local", Direction: "downlink", Value: 400},
+	}, map[string]Identity{
+		"account-1": {AccountUUID: "account-1", Email: "user@example.com"},
+	})
+	if len(got) != 1 {
+		t.Fatalf("expected one UUID sample, got %#v", got)
+	}
+	if got[0].UplinkBytesTotal != 400 || got[0].DownlinkBytesTotal != 600 {
+		t.Fatalf("expected cross-inbound totals, got %#v", got[0])
+	}
+	if got[0].InboundTag != "" {
+		t.Fatalf("billing sample must not retain a line/inbound dimension: %#v", got[0])
+	}
+}
+
 func TestSnapshotHandlerRequiresBearerToken(t *testing.T) {
 	store, err := NewStore("", time.Hour)
 	if err != nil {
