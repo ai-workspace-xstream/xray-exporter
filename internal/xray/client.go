@@ -1,10 +1,12 @@
 package xray
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,6 +67,10 @@ func (c *Client) FetchCounters(ctx context.Context) ([]model.RawCounter, error) 
 		} `json:"stats"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
+		counters := parsePrometheusCounters(body)
+		if len(counters) > 0 {
+			return counters, nil
+		}
 		return nil, fmt.Errorf("decode xray stats payload: %w", err)
 	}
 
@@ -106,6 +112,142 @@ func (c *Client) FetchCounters(ctx context.Context) ([]model.RawCounter, error) 
 		return parseExpvarCounters(expvarPayload), nil
 	}
 	return counters, nil
+}
+
+// parsePrometheusCounters accepts the legacy compassvpn exporter format used
+// by the existing Grafana dashboards. This lets the control-plane exporter
+// consume the already-deployed observation surface without changing its
+// metrics or making Grafana a billing dependency.
+func parsePrometheusCounters(body []byte) []model.RawCounter {
+	const (
+		uplinkMetric   = "xray_traffic_uplink_bytes_total"
+		downlinkMetric = "xray_traffic_downlink_bytes_total"
+	)
+
+	var counters []model.RawCounter
+	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		metricName := line
+		labels := map[string]string{}
+		if brace := strings.IndexByte(line, '{'); brace >= 0 {
+			metricName = strings.TrimSpace(line[:brace])
+			end := strings.LastIndexByte(line, '}')
+			if end < brace {
+				continue
+			}
+			labels = parsePrometheusLabels(line[brace+1 : end])
+			line = strings.TrimSpace(line[end+1:])
+		} else {
+			valueStart := strings.IndexAny(line, " \t")
+			if valueStart < 0 {
+				continue
+			}
+			line = strings.TrimSpace(line[valueStart:])
+		}
+
+		direction := ""
+		switch metricName {
+		case uplinkMetric:
+			direction = "uplink"
+		case downlinkMetric:
+			direction = "downlink"
+		default:
+			continue
+		}
+		if dimension := strings.TrimSpace(labels["dimension"]); dimension != "" && dimension != "user" {
+			continue
+		}
+		identifier := strings.TrimSpace(labels["target"])
+		if identifier == "" {
+			identifier = strings.TrimSpace(labels["email"])
+		}
+		if identifier == "" {
+			identifier = strings.TrimSpace(labels["uuid"])
+		}
+		if identifier == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		value, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil || value < 0 || value > math.MaxInt64 {
+			continue
+		}
+		inboundTag := strings.TrimSpace(labels["inbound_tag"])
+		if inboundTag == "" {
+			inboundTag = strings.TrimSpace(labels["inbound"])
+		}
+		if inboundTag == "" {
+			inboundTag = strings.TrimSpace(labels["line_code"])
+		}
+		counters = append(counters, model.RawCounter{
+			UUID:       identifier,
+			InboundTag: inboundTag,
+			Direction:  direction,
+			Value:      int64(value),
+		})
+	}
+	return counters
+}
+
+func parsePrometheusLabels(raw string) map[string]string {
+	labels := make(map[string]string)
+	for i := 0; i < len(raw); {
+		for i < len(raw) && (raw[i] == ',' || raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		start := i
+		for i < len(raw) && (raw[i] == '_' || raw[i] >= 'a' && raw[i] <= 'z' || raw[i] >= 'A' && raw[i] <= 'Z' || raw[i] >= '0' && raw[i] <= '9') {
+			i++
+		}
+		if start == i {
+			break
+		}
+		key := raw[start:i]
+		for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		if i >= len(raw) || raw[i] != '=' {
+			break
+		}
+		i++
+		for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		if i >= len(raw) || raw[i] != '"' {
+			break
+		}
+		i++
+		var value strings.Builder
+		for i < len(raw) {
+			if raw[i] == '"' {
+				i++
+				break
+			}
+			if raw[i] == '\\' && i+1 < len(raw) {
+				i++
+				switch raw[i] {
+				case 'n':
+					value.WriteByte('\n')
+				default:
+					value.WriteByte(raw[i])
+				}
+				i++
+				continue
+			}
+			value.WriteByte(raw[i])
+			i++
+		}
+		labels[key] = value.String()
+	}
+	return labels
 }
 
 func parseExpvarCounters(payload map[string]json.RawMessage) []model.RawCounter {

@@ -47,3 +47,21 @@ func TestParseExpvarCountersFromDebugVarsStylePayload(t *testing.T) {
 		t.Fatalf("expected parsed uuids in counters %#v", counters)
 	}
 }
+
+func TestParsePrometheusCountersFromLegacyExporter(t *testing.T) {
+	body := []byte("# HELP xray_traffic_downlink_bytes_total legacy\n" +
+		"xray_traffic_downlink_bytes_total{dimension=\"user\",target=\"user@example.com\",inbound_tag=\"xhttp\"} 2048\n" +
+		"xray_traffic_uplink_bytes_total{dimension=\"user\",target=\"user@example.com\",inbound_tag=\"xhttp\"} 512\n" +
+		"xray_traffic_downlink_bytes_total{dimension=\"system\",target=\"ignored\"} 999\n")
+
+	counters := parsePrometheusCounters(body)
+	if len(counters) != 2 {
+		t.Fatalf("expected two user counters, got %#v", counters)
+	}
+	if counters[0].UUID != "user@example.com" || counters[0].InboundTag != "xhttp" || counters[0].Direction != "downlink" || counters[0].Value != 2048 {
+		t.Fatalf("unexpected downlink counter %#v", counters[0])
+	}
+	if counters[1].Direction != "uplink" || counters[1].Value != 512 {
+		t.Fatalf("unexpected uplink counter %#v", counters[1])
+	}
+}
