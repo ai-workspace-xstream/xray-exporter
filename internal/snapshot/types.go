@@ -1,6 +1,19 @@
-package model
+package snapshot
 
 import "time"
+
+type RawCounter struct {
+	Identifier string
+	InboundTag string
+	Direction  string
+	Value      int64
+}
+
+type Identity struct {
+	ProxyUUID   string `json:"uuid"`
+	Email       string `json:"email"`
+	AccountUUID string `json:"accountUuid"`
+}
 
 type Sample struct {
 	UUID               string `json:"uuid"`
@@ -17,7 +30,7 @@ type Snapshot struct {
 	Samples     []Sample  `json:"samples"`
 }
 
-type SnapshotWindowPage struct {
+type WindowPage struct {
 	NodeID     string     `json:"node_id"`
 	Env        string     `json:"env"`
 	Snapshots  []Snapshot `json:"snapshots"`
@@ -25,15 +38,10 @@ type SnapshotWindowPage struct {
 	NextCursor string     `json:"next_cursor,omitempty"`
 }
 
-type RawCounter struct {
-	UUID       string
-	InboundTag string
-	Direction  string
-	Value      int64
+type CounterSource interface {
+	TrafficCounters(time.Duration) ([]RawCounter, error)
 }
 
-type Identity struct {
-	UUID        string `json:"uuid"`
-	Email       string `json:"email"`
-	AccountUUID string `json:"accountUuid"`
+type IdentitySource interface {
+	FetchIdentities(time.Duration) (map[string]Identity, error)
 }

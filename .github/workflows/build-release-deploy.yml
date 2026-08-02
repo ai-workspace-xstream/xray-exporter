@@ -1,0 +1,156 @@
+name: Build-Release-Deploy
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: true
+
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt-formatted:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
+
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: '1.26'
+        cache: true
+        
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        # Build variables
+        VERSION=${{ github.ref_name }}
+        if [[ ! "${{ github.ref }}" =~ ^refs/tags/ ]]; then
+          VERSION=${{ github.sha }}
+        fi
+        
+        # Build binary
+        mkdir -p dist
+        BINARY="xray-exporter-${{ matrix.goos }}-${{ matrix.goarch }}"
+        [ "${{ matrix.goos }}" = "windows" ] && BINARY="${BINARY}.exe"
+        
+        go build -ldflags="-s -w -X main.buildCommit=${{ github.sha }} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.buildVersion=${VERSION}" -o "dist/${BINARY}" .
+        
+        # Make binary executable
+        chmod +x "dist/${BINARY}"
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: xray-exporter-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: dist/
+        retention-days: 7
+
+  docker:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v7
+      with:
+        path: dist/
+        pattern: xray-exporter-linux-*
+        merge-multiple: true
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Build and push multi-arch image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64,linux/arm/v7
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          ${{ startsWith(github.ref, 'refs/tags/') && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v7
+      with:
+        path: dist/
+        pattern: xray-exporter-*
+        merge-multiple: true
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/*
+        generate_release_notes: true 
