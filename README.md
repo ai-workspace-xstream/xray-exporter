@@ -4,7 +4,7 @@
 
 It polls raw Xray traffic counters, enriches them with account identity labels from
 `accounts.svc.plus`, exposes Prometheus metrics, and publishes normalized snapshots
-for `billing-service`.
+to a local Vector HTTP source for `billing-service`.
 
 ## Endpoints
 
@@ -28,7 +28,14 @@ for `billing-service`.
 - `EXPORTER_ENV`
 - `SCRAPE_INTERVAL`
 - `LISTEN_ADDR`
+- `VECTOR_SNAPSHOT_URL` (optional; when set, POST normalized snapshots to this
+  Vector HTTP source. The exporter never calls Billing directly.)
 
 The snapshot history contains UUIDs and display-only email metadata. Keep the
 exporter listener on a protected internal network; `/metrics` is intentionally
 unauthenticated for Prometheus but must not be exposed publicly.
+
+When `VECTOR_SNAPSHOT_URL` is configured, the exporter first stores each
+snapshot locally and then posts it to Vector. A failed push marks the exporter
+degraded and is retried during the next collection cycle; Vector owns disk
+buffering and delivery to Billing.

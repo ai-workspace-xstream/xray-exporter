@@ -14,6 +14,7 @@ type Config struct {
 	InternalServiceToken string
 	SnapshotStorePath    string
 	SnapshotRetention    time.Duration
+	VectorSnapshotURL    string
 	NodeID               string
 	Env                  string
 	ScrapeInterval       time.Duration
@@ -27,6 +28,7 @@ func Load() (Config, error) {
 		AccountsBaseURL:      strings.TrimSpace(os.Getenv("ACCOUNTS_BASE_URL")),
 		InternalServiceToken: strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_TOKEN")),
 		SnapshotStorePath:    strings.TrimSpace(os.Getenv("SNAPSHOT_STORE_PATH")),
+		VectorSnapshotURL:    strings.TrimSpace(os.Getenv("VECTOR_SNAPSHOT_URL")),
 		NodeID:               strings.TrimSpace(os.Getenv("EXPORTER_NODE_ID")),
 		Env:                  strings.TrimSpace(os.Getenv("EXPORTER_ENV")),
 		ListenAddr:           strings.TrimSpace(os.Getenv("LISTEN_ADDR")),

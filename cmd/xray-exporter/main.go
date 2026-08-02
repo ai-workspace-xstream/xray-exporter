@@ -12,6 +12,7 @@ import (
 	"xray-exporter/internal/history"
 	"xray-exporter/internal/httpapi"
 	"xray-exporter/internal/service"
+	"xray-exporter/internal/snapshotpush"
 	"xray-exporter/internal/xray"
 )
 
@@ -30,6 +31,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	var sink service.SnapshotSink
+	if cfg.VectorSnapshotURL != "" {
+		sink = snapshotpush.New(cfg.VectorSnapshotURL, cfg.InternalServiceToken)
+	}
+
 	svc := service.New(
 		cfg.NodeID,
 		cfg.Env,
@@ -37,6 +43,7 @@ func main() {
 		xray.NewClient(cfg.XrayStatsURL, cfg.XrayStatsToken),
 		accounts.NewClient(cfg.AccountsBaseURL, cfg.InternalServiceToken),
 		store,
+		sink,
 	)
 	svc.Start(ctx)
 

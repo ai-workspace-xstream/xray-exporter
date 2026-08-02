@@ -26,6 +26,13 @@ type historyStore interface {
 	WindowSnapshots(ctx context.Context, since, until time.Time, limit int, cursor *time.Time) ([]model.Snapshot, error)
 }
 
+// SnapshotSink receives normalized snapshots after they are durably stored
+// locally. A sink failure degrades collection health, while the local history
+// remains available for replay and the next collection retries the delivery.
+type SnapshotSink interface {
+	PushSnapshot(ctx context.Context, snapshot model.Snapshot) error
+}
+
 type Service struct {
 	nodeID         string
 	env            string
@@ -33,6 +40,7 @@ type Service struct {
 	counters       counterSource
 	identities     identitySource
 	history        historyStore
+	sink           SnapshotSink
 
 	mu              sync.RWMutex
 	latest          model.Snapshot
@@ -42,7 +50,11 @@ type Service struct {
 	lastCollectOK   bool
 }
 
-func New(nodeID, env string, scrapeInterval time.Duration, counters counterSource, identities identitySource, history historyStore) *Service {
+func New(nodeID, env string, scrapeInterval time.Duration, counters counterSource, identities identitySource, history historyStore, sinks ...SnapshotSink) *Service {
+	var sink SnapshotSink
+	if len(sinks) > 0 {
+		sink = sinks[0]
+	}
 	return &Service{
 		nodeID:         strings.TrimSpace(nodeID),
 		env:            strings.TrimSpace(env),
@@ -50,6 +62,7 @@ func New(nodeID, env string, scrapeInterval time.Duration, counters counterSourc
 		counters:       counters,
 		identities:     identities,
 		history:        history,
+		sink:           sink,
 	}
 }
 
@@ -92,12 +105,21 @@ func (s *Service) Collect(ctx context.Context) error {
 		s.recordFailure(err)
 		return err
 	}
+
+	message := ""
 	if identitiesErr != nil {
-		s.recordSuccess(snapshot, fmt.Sprintf("identity lookup degraded: %v", identitiesErr))
-		return nil
+		message = fmt.Sprintf("identity lookup degraded: %v", identitiesErr)
 	}
 
-	s.recordSuccess(snapshot, "")
+	// Publish only after the snapshot is durably stored locally. This keeps the
+	// exporter replayable when Vector or Billing is temporarily unavailable.
+	s.recordSuccess(snapshot, message)
+	if s.sink != nil {
+		if err := s.sink.PushSnapshot(ctx, snapshot); err != nil {
+			s.recordFailure(fmt.Errorf("push snapshot to vector: %w", err))
+			return err
+		}
+	}
 	return nil
 }
 

@@ -39,6 +39,19 @@ type memoryHistory struct {
 	snapshots []model.Snapshot
 }
 
+type snapshotSink struct {
+	snapshots []model.Snapshot
+	err       error
+}
+
+func (s *snapshotSink) PushSnapshot(_ context.Context, snapshot model.Snapshot) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.snapshots = append(s.snapshots, snapshot)
+	return nil
+}
+
 func (m *memoryHistory) SaveSnapshot(_ context.Context, snapshot model.Snapshot) error {
 	for i, existing := range m.snapshots {
 		if existing.CollectedAt.Equal(snapshot.CollectedAt) {
@@ -234,5 +247,53 @@ func TestNormalizeSnapshotAggregatesByUUIDAndInboundTag(t *testing.T) {
 	}
 	if snapshot.Samples[0].InboundTag != "basic" || snapshot.Samples[1].InboundTag != "premium" {
 		t.Fatalf("unexpected sample ordering %#v", snapshot.Samples)
+	}
+}
+
+func TestCollectPushesSnapshotAfterLocalSave(t *testing.T) {
+	history := &memoryHistory{}
+	sink := &snapshotSink{}
+	svc := New(
+		"uat-node",
+		"uat",
+		time.Minute,
+		stubCounterSource{counters: []model.RawCounter{{UUID: "acct-1", Direction: "downlink", Value: 42}}},
+		stubIdentitySource{identities: map[string]model.Identity{"acct-1": {UUID: "acct-1", Email: "admin@example.test"}}},
+		history,
+		sink,
+	)
+
+	if err := svc.Collect(context.Background()); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(history.snapshots) != 1 || len(sink.snapshots) != 1 {
+		t.Fatalf("expected one locally stored and pushed snapshot, got %d and %d", len(history.snapshots), len(sink.snapshots))
+	}
+	if sink.snapshots[0].Samples[0].UUID != "acct-1" {
+		t.Fatalf("unexpected pushed snapshot %#v", sink.snapshots[0])
+	}
+}
+
+func TestCollectDegradesWhenSnapshotPushFailsAfterLocalSave(t *testing.T) {
+	history := &memoryHistory{}
+	svc := New(
+		"uat-node",
+		"uat",
+		time.Minute,
+		stubCounterSource{counters: []model.RawCounter{{UUID: "acct-1", Direction: "downlink", Value: 42}}},
+		stubIdentitySource{},
+		history,
+		&snapshotSink{err: errors.New("vector unavailable")},
+	)
+
+	if err := svc.Collect(context.Background()); err == nil {
+		t.Fatal("expected push error")
+	}
+	if len(history.snapshots) != 1 {
+		t.Fatalf("expected local snapshot to remain durable, got %d", len(history.snapshots))
+	}
+	ok, message := svc.Health()
+	if ok || !strings.Contains(message, "push snapshot to vector") {
+		t.Fatalf("expected degraded health after push failure, got ok=%v message=%q", ok, message)
 	}
 }
