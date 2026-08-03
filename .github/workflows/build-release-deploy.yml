@@ -3,7 +3,18 @@ name: Build-Release-Deploy
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    tags: [ 'v*', 'uat-daily-build-*' ]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build; must already identify the intended source commit"
+        required: true
+        type: string
+      source_ref:
+        description: "Git ref to build, normally the same snapshot tag"
+        required: true
+        default: main
+        type: string
   pull_request:
     branches: [ main ]
 
@@ -13,12 +24,16 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+  RELEASE_REF: ${{ inputs.source_ref || github.ref }}
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+      with:
+        ref: ${{ env.RELEASE_REF }}
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -60,6 +75,8 @@ jobs:
             goarch: arm64
     steps:
     - uses: actions/checkout@v6
+      with:
+        ref: ${{ env.RELEASE_REF }}
     
     - name: Set up Go
       uses: actions/setup-go@v6
@@ -74,8 +91,8 @@ jobs:
         CGO_ENABLED: 0
       run: |
         # Build variables
-        VERSION=${{ github.ref_name }}
-        if [[ ! "${{ github.ref }}" =~ ^refs/tags/ ]]; then
+        VERSION=${{ env.RELEASE_TAG }}
+        if [[ -z "${{ inputs.release_tag }}" && ! "${{ github.ref }}" =~ ^refs/tags/ ]]; then
           VERSION=${{ github.sha }}
         fi
         
@@ -105,6 +122,8 @@ jobs:
       packages: write
     steps:
     - uses: actions/checkout@v6
+      with:
+        ref: ${{ env.RELEASE_REF }}
     
     - name: Download all artifacts
       uses: actions/download-artifact@v7
@@ -130,13 +149,13 @@ jobs:
         platforms: linux/amd64,linux/arm64,linux/arm/v7
         push: true
         tags: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          ${{ startsWith(github.ref, 'refs/tags/') && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+          ${{ (startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '') && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -152,5 +171,6 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ env.RELEASE_TAG }}
         files: dist/*
         generate_release_notes: true 
