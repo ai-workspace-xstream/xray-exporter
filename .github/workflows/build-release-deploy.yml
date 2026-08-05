@@ -3,7 +3,7 @@ name: Build-Release-Deploy
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*', 'uat-daily-build-*' ]
+    tags: [ 'v*', 'daily-build-*', 'uat-daily-build-*' ]
   workflow_dispatch:
     inputs:
       release_tag:
