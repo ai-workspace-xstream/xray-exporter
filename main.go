@@ -149,17 +149,19 @@ func main() {
 	var snapshotStore *snapshot.Store
 	var snapshotService *snapshot.Service
 	var snapshotPusher *snapshot.Pusher
+	transport := snapshot.DeriveTransport(nodeID, environment)
+	snapshotMetrics := snapshot.DefaultMetrics()
 	if nodeID != "" && internalServiceToken != "" && accountsBaseURL != "" {
 		snapshotStore, err = snapshot.NewStore(snapshotStorePath, snapshotRetention)
 		if err != nil {
 			logrus.WithError(err).Fatal("Failed to create snapshot store")
 		}
-		snapshotService = snapshot.NewService(nodeID, environment, exporter, snapshot.NewAccountsClient(accountsBaseURL, internalServiceToken), snapshotStore, scrapeTimeout)
-		if vectorSnapshotURL != "" {
-			snapshotPusher = snapshot.NewPusher(vectorSnapshotURL, internalServiceToken, scrapeTimeout)
-		}
+		accountsClient := snapshot.NewAccountsClient(accountsBaseURL, internalServiceToken).WithTelemetry(environment, transport, snapshotMetrics)
+		snapshotService = snapshot.NewService(nodeID, environment, exporter, accountsClient, snapshotStore, scrapeTimeout).WithTelemetry(transport, snapshotMetrics)
+		snapshotPusher = snapshot.NewPusher(vectorSnapshotURL, internalServiceToken, scrapeTimeout).WithTelemetry(environment, transport, snapshotMetrics)
 		go runSnapshotLoop(snapshotService, snapshotInterval, snapshotPusher)
 	} else {
+		snapshotMetrics.SetPushEnabled(environment, transport, false)
 		logrus.Warn("Billing snapshots disabled: EXPORTER_NODE_ID, ACCOUNTS_BASE_URL and INTERNAL_SERVICE_TOKEN are required")
 	}
 
