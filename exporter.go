@@ -101,6 +101,9 @@ func NewExporterWithLogConfig(endpoint string, scrapeTimeout time.Duration, user
 	}
 
 	e.registry.MustRegister(&e)
+	for _, collector := range snapshot.DefaultMetrics().Collectors() {
+		_ = e.registry.Register(collector)
+	}
 
 	// Create simple gRPC connection
 	// No keepalive needed for short, infrequent calls every 15-30s

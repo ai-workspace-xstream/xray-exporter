@@ -1,47 +1,124 @@
 package snapshot
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 )
 
+type contextualIdentitySource interface {
+	FetchIdentitiesWithContext(ctx context.Context, timeout time.Duration) (map[string]Identity, error)
+}
+
 type Service struct {
 	nodeID     string
 	env        string
+	transport  string
 	source     CounterSource
 	identities IdentitySource
 	store      *Store
 	timeout    time.Duration
+	metrics    *Metrics
 }
 
 func NewService(nodeID, env string, source CounterSource, identities IdentitySource, store *Store, timeout time.Duration) *Service {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return &Service{nodeID: strings.TrimSpace(nodeID), env: strings.TrimSpace(env), source: source, identities: identities, store: store, timeout: timeout}
+	trimmedNode := strings.TrimSpace(nodeID)
+	trimmedEnv := strings.TrimSpace(env)
+	transport := DeriveTransport(trimmedNode, trimmedEnv)
+	metrics := DefaultMetrics()
+	if ac, ok := identities.(*AccountsClient); ok && ac != nil {
+		ac.WithTelemetry(trimmedEnv, transport, metrics)
+	}
+	return &Service{
+		nodeID:     trimmedNode,
+		env:        trimmedEnv,
+		transport:  transport,
+		source:     source,
+		identities: identities,
+		store:      store,
+		timeout:    timeout,
+		metrics:    metrics,
+	}
+}
+
+func (s *Service) WithTelemetry(transport string, metrics *Metrics) *Service {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(transport) != "" {
+		s.transport = strings.TrimSpace(transport)
+	}
+	if metrics != nil {
+		s.metrics = metrics
+	}
+	if ac, ok := s.identities.(*AccountsClient); ok && ac != nil {
+		ac.WithTelemetry(s.env, s.transport, s.metrics)
+	}
+	return s
 }
 
 func (s *Service) Collect() (Snapshot, error) {
-	if s.source == nil || s.store == nil {
+	if s == nil || s.source == nil || s.store == nil {
 		return Snapshot{}, fmt.Errorf("snapshot service is not configured")
 	}
+	metrics := s.metrics
+	if metrics == nil {
+		metrics = DefaultMetrics()
+	}
+	transport := sanitizeTransport(s.transport, s.nodeID, s.env)
+	traceParent := GenerateTraceParent()
+	ctx := WithTraceParent(context.Background(), traceParent)
+
+	xrayStart := time.Now()
 	counters, err := s.source.TrafficCounters(s.timeout)
+	metrics.ObserveCollectStage(s.env, transport, "xray_counters", time.Since(xrayStart))
 	if err != nil {
+		metrics.IncCollectOutcome(s.env, transport, "xray_error")
 		return Snapshot{}, err
 	}
+
 	identities := map[string]Identity{}
 	if s.identities != nil {
-		identities, err = s.identities.FetchIdentities(s.timeout)
+		idStart := time.Now()
+		if ctxSource, ok := s.identities.(contextualIdentitySource); ok {
+			identities, err = ctxSource.FetchIdentitiesWithContext(ctx, s.timeout)
+		} else {
+			identities, err = s.identities.FetchIdentities(s.timeout)
+		}
+		metrics.ObserveCollectStage(s.env, transport, "accounts_identities", time.Since(idStart))
 		if err != nil {
+			metrics.IncCollectOutcome(s.env, transport, "identities_error")
 			return Snapshot{}, err
 		}
 	}
-	snapshot := Snapshot{CollectedAt: time.Now().UTC(), NodeID: s.nodeID, Env: s.env}
+
+	normStart := time.Now()
+	collectedAt := time.Now().UTC()
+	snapshot := Snapshot{
+		CollectedAt: collectedAt,
+		NodeID:      s.nodeID,
+		Env:         s.env,
+		SnapshotRef: GenerateSnapshotRef(s.env, s.nodeID, collectedAt),
+		TraceParent: traceParent,
+	}
 	snapshot.Samples = normalize(counters, identities)
-	if err := s.store.Save(snapshot); err != nil {
+	err = s.store.Save(snapshot)
+	metrics.ObserveCollectStage(s.env, transport, "normalize_save", time.Since(normStart))
+	if err != nil {
+		metrics.IncCollectOutcome(s.env, transport, "store_error")
 		return Snapshot{}, err
+	}
+
+	metrics.RecordCollectSuccess(s.env, transport, collectedAt, len(snapshot.Samples))
+	if len(snapshot.Samples) == 0 {
+		metrics.IncCollectOutcome(s.env, transport, "empty_samples")
+	} else {
+		metrics.IncCollectOutcome(s.env, transport, "ok")
 	}
 	return snapshot, nil
 }
