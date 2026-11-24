@@ -94,7 +94,7 @@ func writeTestServerConfig(t *testing.T, path, listen string, port int, users []
       }
     }
   ]
-}`, listen, portLine, strings.Join(clients, ","), )
+}`, listen, portLine, strings.Join(clients, ","))
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("write config %s: %v", path, err)
 	}
