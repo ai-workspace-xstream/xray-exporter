@@ -4,6 +4,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -13,10 +14,6 @@ import (
 	"github.com/oschwald/geoip2-golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/xtls/xray-core/app/stats/command"
 
 	"xray-exporter/internal/geoip"
 	"xray-exporter/internal/logparser"
@@ -27,16 +24,15 @@ import (
 const DefaultLogTimeWindowMinutes = 5
 
 // Collects Xray metrics and exposes them in Prometheus format.
-// Connects to Xray's gRPC API for runtime stats and optionally parses
-// access logs for user activity metrics.
+// Reads runtime stats via StatsReader (either in-memory from embedded Xray-core
+// or via gRPC API) and optionally parses access logs for user activity metrics.
 type Exporter struct {
-	endpoint           string
+	statsReader        StatsReader
 	scrapeTimeout      time.Duration
 	userTrafficMetrics bool
 	registry           *prometheus.Registry
 	totalScrapes       prometheus.Counter
 	metricDescriptions map[string]*prometheus.Desc
-	conn               *grpc.ClientConn
 
 	// Log parsing for user metrics
 	logParser     *logparser.Parser
@@ -49,11 +45,27 @@ type Exporter struct {
 	geoipCountryReader *geoip2.Reader
 }
 
-// Creates a new Xray exporter with custom log parsing configuration.
-// Pass empty logPath to disable user metrics from log parsing.
+// NewExporterWithLogConfig creates an Xray exporter backed by Xray's gRPC Stats API.
+// Pass empty logPath (or "disabled") to disable user metrics from log parsing.
 func NewExporterWithLogConfig(endpoint string, scrapeTimeout time.Duration, userTrafficMetrics bool, logPath string, logTimeWindow time.Duration) (*Exporter, error) {
+	reader, err := newGRPCStatsReader(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return NewExporterWithStatsReader(reader, scrapeTimeout, userTrafficMetrics, logPath, logTimeWindow)
+}
+
+// NewExporterWithStatsReader creates an Xray exporter using the provided StatsReader.
+func NewExporterWithStatsReader(reader StatsReader, scrapeTimeout time.Duration, userTrafficMetrics bool, logPath string, logTimeWindow time.Duration) (*Exporter, error) {
+	if reader == nil {
+		return nil, errors.New("stats reader is required")
+	}
+	if scrapeTimeout <= 0 {
+		scrapeTimeout = 5 * time.Second
+	}
+
 	e := Exporter{
-		endpoint:           endpoint,
+		statsReader:        reader,
 		scrapeTimeout:      scrapeTimeout,
 		userTrafficMetrics: userTrafficMetrics,
 		registry:           prometheus.NewRegistry(),
@@ -102,40 +114,28 @@ func NewExporterWithLogConfig(endpoint string, scrapeTimeout time.Duration, user
 
 	e.registry.MustRegister(&e)
 
-	// Create simple gRPC connection
-	// No keepalive needed for short, infrequent calls every 15-30s
-	conn, err := grpc.NewClient(endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
-	}
-
-	e.conn = conn
-
-	// Initialize GeoIP readers. GeoIP is optional enrichment, so a missing or
-	// unreadable database is logged and skipped rather than being fatal.
-	if asnDB, err := geoip2.Open(geoip.ASNPath()); err != nil {
-		logrus.WithError(err).Warn("Failed to open GeoIP ASN database, ASN metrics will be unavailable")
-	} else {
-		e.geoipASNReader = asnDB
-	}
-
-	if cityDB, err := geoip2.Open(geoip.CityPath()); err != nil {
-		// If city database is missing, we still continue but city/country metrics will be unknown
-		logrus.WithError(err).Warn("Failed to open GeoIP City database, city/country metrics will be unavailable")
-	} else {
-		e.geoipCityReader = cityDB
-	}
-
-	if countryDB, err := geoip2.Open(geoip.CountryPath()); err != nil {
-		logrus.WithError(err).Warn("Failed to open GeoIP Country database, country metrics will be limited")
-	} else {
-		e.geoipCountryReader = countryDB
-	}
-
-	// Initialize log parser if path provided
+	// Initialize GeoIP readers and log parser only when access log parsing is enabled.
 	if logPath != "" && logPath != "disabled" {
+		// GeoIP is optional enrichment, so missing or unreadable databases are
+		// logged and skipped rather than being fatal.
+		if asnDB, err := geoip2.Open(geoip.ASNPath()); err != nil {
+			logrus.WithError(err).Warn("Failed to open GeoIP ASN database, ASN metrics will be unavailable")
+		} else {
+			e.geoipASNReader = asnDB
+		}
+
+		if cityDB, err := geoip2.Open(geoip.CityPath()); err != nil {
+			logrus.WithError(err).Warn("Failed to open GeoIP City database, city/country metrics will be unavailable")
+		} else {
+			e.geoipCityReader = cityDB
+		}
+
+		if countryDB, err := geoip2.Open(geoip.CountryPath()); err != nil {
+			logrus.WithError(err).Warn("Failed to open GeoIP Country database, country metrics will be limited")
+		} else {
+			e.geoipCountryReader = countryDB
+		}
+
 		if _, err := os.Stat(logPath); err != nil {
 			logrus.WithError(err).Warn("Log file not found, user metrics will not be available")
 		} else {
@@ -215,35 +215,30 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	)
 }
 
-// Connects to Xray's gRPC API and collects all available metrics.
+// Reads Xray runtime and traffic metrics via the configured StatsReader.
 func (e *Exporter) scrapeXray(ch chan<- prometheus.Metric) error {
 	ctx, cancel := context.WithTimeout(context.Background(), e.scrapeTimeout)
 	defer cancel()
 
-	client := command.NewStatsServiceClient(e.conn)
-
-	if err := e.scrapeXraySysMetrics(ctx, ch, client); err != nil {
+	if err := e.scrapeXraySysMetrics(ctx, ch); err != nil {
 		return err
 	}
 
-	if err := e.scrapeXrayMetrics(ctx, ch, client); err != nil {
+	if err := e.scrapeXrayMetrics(ctx, ch); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// Collects traffic statistics from Xray's stats API.
-func (e *Exporter) scrapeXrayMetrics(ctx context.Context, ch chan<- prometheus.Metric, client command.StatsServiceClient) error {
-	resp, err := e.callWithRetry(ctx, func() (any, error) {
-		return client.QueryStats(ctx, &command.QueryStatsRequest{Reset_: false})
-	})
+// Collects traffic statistics from Xray's stats API or in-memory stats.Manager.
+func (e *Exporter) scrapeXrayMetrics(ctx context.Context, ch chan<- prometheus.Metric) error {
+	stats, err := e.statsReader.QueryStats(ctx, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to get stats: %w", err)
 	}
 
-	statsResp := resp.(*command.QueryStatsResponse)
-	for _, s := range statsResp.GetStat() {
+	for _, s := range stats {
 		// Parse format: inbound>>>socks-proxy>>>traffic>>>uplink
 		p := strings.Split(s.GetName(), ">>>")
 
@@ -272,21 +267,18 @@ func (e *Exporter) scrapeXrayMetrics(ctx context.Context, ch chan<- prometheus.M
 }
 
 // TrafficCounters returns the raw cumulative per-user counters used by the
-// billing snapshot API. It deliberately reuses the same Xray Stats API and
+// billing snapshot API. It deliberately reuses the same Xray Stats source and
 // filtering rules as the Prometheus collector, so the observability and
 // billing paths have one source of truth without changing /scrape output.
 func (e *Exporter) TrafficCounters(timeout time.Duration) ([]snapshot.RawCounter, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	resp, err := e.callWithRetry(ctx, func() (any, error) {
-		return command.NewStatsServiceClient(e.conn).QueryStats(ctx, &command.QueryStatsRequest{Reset_: false})
-	})
+	stats, err := e.statsReader.QueryStats(ctx, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stats: %w", err)
 	}
-	statsResp := resp.(*command.QueryStatsResponse)
 	counters := make([]snapshot.RawCounter, 0)
-	for _, stat := range statsResp.GetStat() {
+	for _, stat := range stats {
 		parts := strings.Split(stat.GetName(), ">>>")
 		if len(parts) < 4 || parts[0] != "user" {
 			continue
@@ -304,15 +296,12 @@ func (e *Exporter) TrafficCounters(timeout time.Duration) ([]snapshot.RawCounter
 }
 
 // Collects system runtime metrics from Xray.
-func (e *Exporter) scrapeXraySysMetrics(ctx context.Context, ch chan<- prometheus.Metric, client command.StatsServiceClient) error {
-	resp, err := e.callWithRetry(ctx, func() (any, error) {
-		return client.GetSysStats(ctx, &command.SysStatsRequest{})
-	})
+func (e *Exporter) scrapeXraySysMetrics(ctx context.Context, ch chan<- prometheus.Metric) error {
+	sysResp, err := e.statsReader.GetSysStats(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get sys stats: %w", err)
 	}
 
-	sysResp := resp.(*command.SysStatsResponse)
 	e.registerConstMetricGauge(ch, "uptime_seconds", float64(sysResp.GetUptime()))
 
 	// Memory and runtime metrics following Go collector naming conventions
@@ -328,35 +317,6 @@ func (e *Exporter) scrapeXraySysMetrics(ctx context.Context, ch chan<- prometheu
 	e.registerConstMetricGauge(ch, "memstats_pause_total_ns", float64(sysResp.GetPauseTotalNs()))
 
 	return nil
-}
-
-// Implements exponential backoff retry for gRPC calls.
-// Helps handle temporary network issues or Xray restarts.
-func (e *Exporter) callWithRetry(ctx context.Context, fn func() (any, error)) (any, error) {
-	maxRetries := 3
-	baseDelay := 100 * time.Millisecond
-
-	for attempt := range maxRetries {
-		resp, err := fn()
-		if err == nil {
-			return resp, nil
-		}
-
-		if attempt == maxRetries-1 {
-			return nil, err
-		}
-
-		delay := baseDelay * time.Duration(1<<attempt)
-		logrus.WithError(err).WithField("attempt", attempt+1).WithField("delay", delay).Debug("gRPC call failed, retrying")
-		// Honour the scrape deadline instead of blocking on a fixed sleep.
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	return nil, fmt.Errorf("max retries exceeded")
 }
 
 func (e *Exporter) registerConstMetricGauge(ch chan<- prometheus.Metric, metric string, val float64, labels ...string) {
@@ -506,7 +466,7 @@ func (e *Exporter) collectCityMetrics(ch chan<- prometheus.Metric) {
 	}
 }
 
-// Properly closes gRPC connection and stops log parser.
+// Properly closes StatsReader (gRPC or embedded Xray engine) and stops log parser.
 func (e *Exporter) Close() error {
 	if e.logParser != nil {
 		e.logParser.Stop()
@@ -520,8 +480,8 @@ func (e *Exporter) Close() error {
 	if e.geoipCountryReader != nil {
 		e.geoipCountryReader.Close()
 	}
-	if e.conn != nil {
-		return e.conn.Close()
+	if e.statsReader != nil {
+		return e.statsReader.Close()
 	}
 	return nil
 }
