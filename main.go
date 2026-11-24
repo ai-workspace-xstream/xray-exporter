@@ -642,7 +642,7 @@ func runMain(args []string, getenv func(string) (string, bool), stdout, stderr i
 			}
 			return 1
 		}
-		if !engine.HasStatsManager() {
+		if !engine.HasStatsManager() && (cfg.Listen != "" || cfg.snapshotsEnabled()) {
 			logrus.Warn("Embedded Xray config does not enable stats ({}); traffic metrics and billing snapshots will be empty")
 		}
 		logrus.WithFields(logrus.Fields{
@@ -659,20 +659,21 @@ func runMain(args []string, getenv func(string) (string, bool), stdout, stderr i
 		}
 	}
 
-	// Initialize GeoIP only when access log parsing is enabled (and in embedded mode
-	// only if the access log file exists, so startup never blocks when access logs
-	// are not configured).
-	if cfg.LogPath != "" && cfg.LogPath != "disabled" && !cfg.DisableGeoIPDownload {
-		shouldDownloadGeoIP := !cfg.Embedded
-		if cfg.Embedded {
-			if _, statErr := os.Stat(cfg.LogPath); statErr == nil {
-				shouldDownloadGeoIP = true
+	// Configure GeoIP directory unconditionally when access-log parsing is enabled,
+	// even if automatic GeoIP download is disabled (using pre-staged .mmdb files).
+	if cfg.LogPath != "" && cfg.LogPath != "disabled" {
+		geoip.Dir = cfg.GeoIPDir
+		if !cfg.DisableGeoIPDownload {
+			shouldDownloadGeoIP := !cfg.Embedded
+			if cfg.Embedded {
+				if _, statErr := os.Stat(cfg.LogPath); statErr == nil {
+					shouldDownloadGeoIP = true
+				}
 			}
-		}
-		if shouldDownloadGeoIP {
-			geoip.Dir = cfg.GeoIPDir
-			if err := geoip.DownloadDB(); err != nil {
-				logrus.WithError(err).Warn("Failed to initialize GeoIP database, GeoIP metrics will be unavailable")
+			if shouldDownloadGeoIP {
+				if err := geoip.DownloadDB(); err != nil {
+					logrus.WithError(err).Warn("Failed to initialize GeoIP database, GeoIP metrics will be unavailable")
+				}
 			}
 		}
 	}
