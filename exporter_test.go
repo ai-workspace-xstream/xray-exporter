@@ -77,8 +77,7 @@ func TestScrapeXrayMetricsExportsOutboundPoolTrafficRegardlessOfUserTrafficMetri
 			defer exp.Close()
 
 			ch := make(chan prometheus.Metric, 32)
-			client := command.NewStatsServiceClient(exp.conn)
-			if err := exp.scrapeXrayMetrics(context.Background(), ch, client); err != nil {
+			if err := exp.scrapeXrayMetrics(context.Background(), ch); err != nil {
 				t.Fatalf("scrapeXrayMetrics: %v", err)
 			}
 			close(ch)
